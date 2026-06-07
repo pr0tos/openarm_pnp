@@ -1,7 +1,7 @@
 # OpenArm Pick & Place
 
 RL task for the **OpenArm** robot (7-DOF arm + 2-DOF gripper) in **Isaac Sim 5.0 / Isaac Lab**:
-grasp an object (4 cm cube or a r=1.5 cm, h=8 cm bolt-cylinder) from the table and place it
+grasp an object (r=1.5 cm, h=8 cm bolt-cylinder) from the table and place it
 into a KLT bin. Object and tray positions are randomized on every reset. Training — **PPO**
 via `rsl_rl` in **4096 parallel environments**.
 
