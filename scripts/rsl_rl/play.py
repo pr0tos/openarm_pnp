@@ -34,6 +34,13 @@ parser.add_argument(
     help="Use the pre-trained checkpoint from Nucleus.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument(
+    "--homing-steps",
+    type=int,
+    default=60,
+    help="After a successful place, override the policy with a 'go to default joint_pos' command for this many "
+    "agent steps before the env resets. Set to 0 to disable.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -79,6 +86,71 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import openarm_pnp.tasks  # noqa: F401
 
+from isaaclab.managers import SceneEntityCfg
+from openarm_pnp.tasks.manager_based.openarm_pnp.mdp.terminations import screw_in_tray
+
+
+class HomeAfterSuccess:
+    """Drives the robot back to its default joint pose after a successful place.
+
+    When `screw_in_tray` first becomes true for an env, this controller latches a per-env
+    countdown of `homing_steps` agent steps. While the countdown is active it overrides the
+    policy output: zero arm action (interpreted as `target = default_joint_pos` because
+    `arm_action.use_default_offset=True`) and a negative gripper action (open). When the
+    countdown reaches zero the policy regains control until `time_out` resets the env.
+
+    Requires that the `screw_placed_success` termination is disabled, otherwise the env
+    auto-resets on success and there is no time to play the homing motion.
+    """
+
+    # success-check thresholds — mirror the disabled termination
+    _XY_THRESHOLD = 0.08
+    _MAX_HEIGHT_ABOVE_TRAY = 0.12
+    _MAX_VEL = 0.2
+
+    def __init__(self, env, homing_steps: int):
+        self._env = env.unwrapped
+        self._homing_steps = int(homing_steps)
+        self._counter = torch.zeros(self._env.num_envs, dtype=torch.int32, device=self._env.device)
+        self._screw_cfg = SceneEntityCfg("screw")
+        self._tray_cfg = SceneEntityCfg("tray")
+
+    def _is_active(self) -> torch.Tensor:
+        return self._counter > 0
+
+    def override(self, actions: torch.Tensor) -> torch.Tensor:
+        """Detect success and overwrite actions for envs currently in the homing phase."""
+        success = screw_in_tray(
+            self._env,
+            screw_cfg=self._screw_cfg,
+            tray_cfg=self._tray_cfg,
+            xy_threshold=self._XY_THRESHOLD,
+            max_height_above_tray=self._MAX_HEIGHT_ABOVE_TRAY,
+            max_vel=self._MAX_VEL,
+        )
+        # latch the countdown on the rising edge of success
+        rising_edge = success & ~self._is_active()
+        self._counter = torch.where(
+            rising_edge,
+            torch.full_like(self._counter, self._homing_steps),
+            self._counter,
+        )
+
+        active = self._is_active()
+        if active.any():
+            # zero arm action ⇒ target = default joint_pos (use_default_offset=True)
+            actions[active, :7] = 0.0
+            # binary gripper: negative ⇒ open
+            actions[active, 7] = -1.0
+            self._counter = (self._counter - 1).clamp_(min=0)
+
+        return actions
+
+    def on_reset(self, dones: torch.Tensor) -> None:
+        """Clear the countdown for envs that have just been reset."""
+        if dones.any():
+            self._counter = torch.where(dones.bool(), torch.zeros_like(self._counter), self._counter)
+
 
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
@@ -95,6 +167,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+
+    # Disable the success termination so the episode does not auto-reset on placement —
+    # we want time for HomeAfterSuccess to drive the robot back to its default pose first.
+    # The episode will still end on time_out (or screw_dropped). The success_bonus reward
+    # references this termination via term_keys, so it has to go too (rewards are irrelevant
+    # during play anyway).
+    if args_cli.homing_steps > 0 and getattr(env_cfg.terminations, "screw_placed_success", None) is not None:
+        env_cfg.terminations.screw_placed_success = None
+        if getattr(env_cfg.rewards, "success_bonus", None) is not None:
+            env_cfg.rewards.success_bonus = None
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -174,6 +256,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     dt = env.unwrapped.step_dt
 
+    # homing controller: drives the arm to its default pose after a successful place
+    home_after_success = HomeAfterSuccess(env, homing_steps=args_cli.homing_steps) if args_cli.homing_steps > 0 else None
+
     # reset environment
     obs = env.get_observations()
     timestep = 0
@@ -184,8 +269,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         with torch.inference_mode():
             # agent stepping
             actions = policy(obs)
+            if home_after_success is not None:
+                actions = home_after_success.override(actions)
             # env stepping
             obs, _, dones, _ = env.step(actions)
+            if home_after_success is not None:
+                home_after_success.on_reset(dones)
             # reset recurrent states for episodes that have terminated
             policy_nn.reset(dones)
         if args_cli.video:
