@@ -25,7 +25,7 @@ Registered gym id: `Template-Openarm-Pnp-v0`.
 Clone **next to** `IsaacLab` (not inside it):
 
 ```bash
-git clone <repo-url> openarm_pnp
+git clone https://github.com/pr0tos/openarm_pnp.git
 cd openarm_pnp
 ```
 
